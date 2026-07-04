@@ -188,3 +188,209 @@ module morse_top_phase1(
         .state_led(state_led)
     );
 endmodule
+
+module morse_encoder(
+    input wire clk,
+    input wire btn0,
+    input wire btn1,
+    input wire btn2,
+    input wire mode,
+    input wire [3:0] switches,
+    output reg led,
+    output wire state_led
+);
+    // States for the FSM
+    localparam IDLE            = 2'd0;
+    localparam ENCODING_DIGIT  = 2'd1;
+    localparam INTER_DIGIT_GAP = 2'd2;
+    
+    // Morse code patterns
+    reg [4:0] morse_pattern;
+    reg [2:0] pattern_length;
+    
+    // Timing constants (100MHz clock)
+    parameter DOT_CYCLES         = 100_000_000;   // 1 second
+    parameter DASH_CYCLES        = 300_000_000;   // 3 seconds
+    parameter SPACE_CYCLES       = 50_000_000;    // 0.5 seconds (between elements)
+    parameter INTER_DIGIT_CYCLES = 200_000_000;   // 2 seconds (between digits)
+    
+    // Storage registers
+    reg [31:0] counter;
+    reg [2:0] current_element;
+    reg [1:0] current_state;
+    reg is_space;
+    reg btn1_prev, btn2_prev;
+    reg latched_mode;
+    
+    // FIFO registers
+    reg [3:0] fifo [0:5];
+    reg [2:0] write_ptr;
+    reg [2:0] digit_count;
+    reg [2:0] current_digit;
+    reg [3:0] temp_digit;
+    
+    // Loop variable for Verilog-2001 compatibility
+    integer i;
+
+    assign state_led = (current_state != IDLE);
+
+    // Morse pattern generation
+    always @(*) begin
+        case(latched_mode ? fifo[current_digit] : temp_digit)
+            4'd0: begin morse_pattern = 5'b00000; pattern_length = 5; end
+            4'd1: begin morse_pattern = 5'b10000; pattern_length = 5; end
+            4'd2: begin morse_pattern = 5'b11000; pattern_length = 5; end
+            4'd3: begin morse_pattern = 5'b11100; pattern_length = 5; end
+            4'd4: begin morse_pattern = 5'b11110; pattern_length = 5; end
+            4'd5: begin morse_pattern = 5'b11111; pattern_length = 5; end
+            4'd6: begin morse_pattern = 5'b01111; pattern_length = 5; end
+            4'd7: begin morse_pattern = 5'b00111; pattern_length = 5; end
+            4'd8: begin morse_pattern = 5'b00011; pattern_length = 5; end
+            4'd9: begin morse_pattern = 5'b00001; pattern_length = 5; end
+            default: begin morse_pattern = 5'b00000; pattern_length = 0; end
+        endcase
+    end
+
+    // Main sequential logic
+    always @(posedge clk or posedge btn0) begin
+        if (btn0) begin
+            // Asynchronous reset
+            led <= 0;
+            counter <= 0;
+            current_element <= 0;
+            current_state <= IDLE;
+            is_space <= 0;
+            btn1_prev <= 0;
+            btn2_prev <= 0;
+            write_ptr <= 0;
+            digit_count <= 0;
+            current_digit <= 0;
+            temp_digit <= 0;
+            latched_mode <= 0;
+            for (i = 0; i < 6; i = i + 1) fifo[i] <= 0;
+        end
+        else begin
+            // Edge detection for buttons
+            btn1_prev <= btn1;
+            btn2_prev <= btn2;
+            
+            // Store digits in number mode (only when IDLE and not full)
+            if (mode && btn1 && !btn1_prev && digit_count < 6 && current_state == IDLE) begin
+                fifo[write_ptr] <= switches;
+                write_ptr <= write_ptr + 1;
+                digit_count <= digit_count + 1;
+            end
+            
+            case (current_state)
+                IDLE: begin
+                    led <= 0;
+                    if (!mode && btn1 && !btn1_prev) begin  // Digit mode - single digit
+                        temp_digit <= switches;
+                        latched_mode <= 0;
+                        current_state <= ENCODING_DIGIT;
+                        current_digit <= 0;      
+                        digit_count <= 1;        
+                        counter <= 0;
+                        current_element <= 0;
+                        is_space <= 0;
+                    end
+                    else if (mode && btn2 && !btn2_prev && digit_count > 0) begin  // Number mode - start multi-digit
+                        latched_mode <= 1;
+                        current_state <= ENCODING_DIGIT;
+                        current_digit <= 0;       
+                        counter <= 0;
+                        current_element <= 0;
+                        is_space <= 0;
+                    end
+                end
+                
+                ENCODING_DIGIT: begin
+                    if (current_element < pattern_length) begin
+                        if (!is_space) begin
+                            // Sending a dot or dash (LED ON)
+                            led <= 1;
+                            if (morse_pattern[pattern_length - 1 - current_element]) begin
+                                // --- DOT (1 second) ---
+                                if (counter >= DOT_CYCLES - 1) begin
+                                    counter <= 0;
+                                    if (current_element == pattern_length - 1) begin
+                                        // Last element of this digit - no trailing space
+                                        led <= 0;
+                                        if (current_digit < digit_count - 1)
+                                            current_state <= INTER_DIGIT_GAP;
+                                        else
+                                            current_state <= IDLE;
+                                    end
+                                    else begin
+                                        is_space <= 1;   // go to inter-element space
+                                    end
+                                end
+                                else begin
+                                    counter <= counter + 1;
+                                end
+                            end
+                            else begin
+                                // --- DASH (3 seconds) ---
+                                if (counter >= DASH_CYCLES - 1) begin
+                                    counter <= 0;
+                                    if (current_element == pattern_length - 1) begin
+                                        led <= 0;
+                                        if (current_digit < digit_count - 1)
+                                            current_state <= INTER_DIGIT_GAP;
+                                        else
+                                            current_state <= IDLE;
+                                    end
+                                    else begin
+                                        is_space <= 1;
+                                    end
+                                end
+                                else begin
+                                    counter <= counter + 1;
+                                end
+                            end
+                        end
+                        else begin
+                            // Inter-element space (0.5 second OFF)
+                            led <= 0;
+                            if (counter >= SPACE_CYCLES - 1) begin
+                                counter <= 0;
+                                is_space <= 0;
+                                current_element <= current_element + 1;
+                            end
+                            else begin
+                                counter <= counter + 1;
+                            end
+                        end
+                    end
+                    else begin
+                        // Safety net - should never be reached with the new logic
+                        led <= 0;
+                        if (current_digit < digit_count - 1)
+                            current_state <= INTER_DIGIT_GAP;
+                        else
+                            current_state <= IDLE;
+                    end
+                end
+                
+                INTER_DIGIT_GAP: begin
+                    // 2-second LED OFF gap between digits
+                    led <= 0;
+                    if (counter >= INTER_DIGIT_CYCLES - 1) begin
+                        counter <= 0;
+                        current_digit <= current_digit + 1;
+                        current_element <= 0;
+                        is_space <= 0;
+                        current_state <= ENCODING_DIGIT;
+                    end
+                    else begin
+                        counter <= counter + 1;
+                    end
+                end
+                
+                default: begin
+                    current_state <= IDLE;
+                end
+            endcase
+        end
+    end
+endmodule
